@@ -463,7 +463,14 @@ mount -t efivarfs efivarfs "$MNT/sys/firmware/efi/efivars" 2>/dev/null || true
 
 chroot "$MNT" /bin/bash /root/stage2.sh
 
-# ---------------- 11. done ----------------
+# ---------------- 11. remove installer artifacts (they hold plaintext secrets) ----------------
+# install.env carries ROOTPW/LUKSPW/MOKPW in the clear; do not leave it (or the
+# copied stage2) on the installed system.
+for f in "$MNT/root/install.env" "$MNT/root/stage2.sh"; do
+  [ -e "$f" ] && { shred -u "$f" 2>/dev/null || rm -f "$f"; }
+done
+
+# ---------------- 12. done ----------------
 log "unmounting"
 umount -R "$MNT" 2>/dev/null || true
 [ "$USE_LVM" = yes ] && vgchange -an "$VG" 2>/dev/null || true
