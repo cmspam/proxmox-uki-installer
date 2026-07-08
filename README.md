@@ -139,6 +139,33 @@ pve-tpm-enroll
 Reboot, and the root unlocks from the TPM with no passphrase. The policy is
 signed against PCR 11, so kernel upgrades do not break it.
 
+## Changing the kernel command line later
+
+The kernel command line lives in a single file, `/etc/kernel/cmdline`, which the
+UKI build hook reads. It already contains the base line (`root=`, `rootfstype=`,
+any `rootflags` or `rd.lvm.lv`, and whatever you passed as `EXTRA_CMDLINE` at
+install time). To add or change options on the installed system:
+
+```sh
+# 1. edit the single command-line file (one line, space separated)
+$EDITOR /etc/kernel/cmdline
+
+# 2. rebuild and re-sign the UKI for the running kernel
+/etc/kernel/postinst.d/zz-ukify "$(uname -r)"
+
+# for every installed kernel at once:
+for k in /boot/vmlinuz-*; do /etc/kernel/postinst.d/zz-ukify "${k#/boot/vmlinuz-}"; done
+
+# 3. reboot
+```
+
+The hook re-signs the UKI with the MOK, so Secure Boot stays valid, and it
+regenerates the signed PCR 11 policy, so TPM2 auto-unlock keeps working. A
+command-line change is handled the same way as a kernel upgrade.
+
+The usual Debian and Proxmox methods do not apply here: GRUB is disabled, and
+`/etc/cmdline.d/*` is not read for UKIs. `/etc/kernel/cmdline` is the one source.
+
 ## Development
 
 `testmatrix.sh` drives the installer through every mode and option combination
