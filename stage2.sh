@@ -167,6 +167,35 @@ rm -f "/boot/efi/EFI/Linux/proxmox-$version.efi"
 HOOK
 chmod +x /etc/kernel/postinst.d/zz-ukify /etc/kernel/postrm.d/zz-ukify
 
+# ---------- rebuild helper (regenerate + re-sign the UKI after config changes) ----------
+log "install pve-uki-rebuild helper"
+install -d /usr/local/sbin
+cat > /usr/local/sbin/pve-uki-rebuild <<'HELP'
+#!/bin/sh
+# Rebuild and re-sign the UKI after editing /etc/kernel/cmdline or the dracut
+# config. With no argument it rebuilds every installed kernel; pass a version to
+# rebuild just one (e.g. pve-uki-rebuild "$(uname -r)"). It regenerates the
+# initrd, then rebuilds the UKI through the zz-ukify hook, which re-signs it for
+# Secure Boot and regenerates the signed TPM2 PCR policy. Reboot afterwards.
+set -e
+HOOK=/etc/kernel/postinst.d/zz-ukify
+[ -x "$HOOK" ] || { echo "missing $HOOK"; exit 1; }
+build() {
+  v="$1"
+  [ -e "/boot/vmlinuz-$v" ] || { echo "no kernel /boot/vmlinuz-$v"; return 1; }
+  echo "rebuilding initrd + UKI for $v"
+  dracut --force "/boot/initrd.img-$v" "$v"
+  "$HOOK" "$v"
+}
+if [ -n "$1" ]; then
+  build "$1"
+else
+  for k in /boot/vmlinuz-*; do [ -e "$k" ] || continue; build "${k#/boot/vmlinuz-}"; done
+fi
+echo "done. reboot to apply."
+HELP
+chmod +x /usr/local/sbin/pve-uki-rebuild
+
 # ---------- DKMS modules signed with the same MOK (loadable under Secure Boot) ----------
 log "dkms signing via MOK"
 mkdir -p /etc/dkms

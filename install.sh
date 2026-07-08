@@ -28,7 +28,6 @@
 #   LVM_THIN      yes | no  (thin-provision the root LV; LVM only)  [no]
 #   ROOT_SIZE     root LV size, e.g. 64GiB, or 100%FREE (LVM only)  [100%FREE]
 #   USE_LUKS      yes | no                                          [no]
-#   UNLOCK        tpm2 | passphrase (only meaningful with LUKS)     [passphrase]
 #   SECUREBOOT    yes | no (shim+MOK chain; no = plain systemd-boot)[yes]
 #   HOSTONLY      yes | no  (host-specific initramfs vs generic)    [no]
 #   HOSTNAME_     target hostname                                   [pve]
@@ -148,11 +147,10 @@ else
   LVM_THIN="${LVM_THIN:-no}"; ROOT_SIZE="${ROOT_SIZE:-100%FREE}"
 fi
 ask USE_LUKS   "Encrypt root with LUKS?"     no    no yes
-if [ "$USE_LUKS" = yes ]; then
-  ask UNLOCK   "Unlock method"               passphrase  passphrase tpm2
-else
-  UNLOCK="${UNLOCK:-passphrase}"
-fi
+# LUKS always installs a passphrase slot and a crypttab that is ready for TPM2
+# (tpm2-device=auto, harmless with no TPM slot). TPM auto-unlock is an optional
+# post-boot step: run pve-tpm-enroll once the MOK is enrolled. So there is no
+# unlock-method choice at install time.
 ask SECUREBOOT "Secure Boot (shim + MOK)?"   yes   yes no
 ask HOSTONLY   "Host-specific initramfs (vs generic)?" no  no yes
 ask HOSTNAME_  "Hostname"                    pve
@@ -244,7 +242,7 @@ cat <<SUMMARY
   Target      : $_tgt
   Layout      : $_sz
   Filesystem  : $FS$( [ "$FS" = btrfs ] && echo " (subvol @, $BTRFS_OPTS)" )$( [ "$USE_LVM" = yes ] && echo "  on LVM$( [ "$LVM_THIN" = yes ] && echo " (thin)" ), root LV=$ROOT_SIZE" )
-  LUKS        : $USE_LUKS$( [ "$USE_LUKS" = yes ] && echo "  (unlock: $UNLOCK)" )
+  LUKS        : $USE_LUKS$( [ "$USE_LUKS" = yes ] && echo "  (passphrase now; add TPM later with pve-tpm-enroll)" )
   Secure Boot : $SECUREBOOT$( [ "$SECUREBOOT" = yes ] && echo "  (shim + MOK, confirm at MokManager)" )
   Initramfs   : $( [ "$HOSTONLY" = yes ] && echo host-specific || echo generic )
   Hostname    : $HOSTNAME_
@@ -417,7 +415,6 @@ FS="${FS}"
 USE_LVM="${USE_LVM}"
 LVM_THIN="${LVM_THIN}"
 USE_LUKS="${USE_LUKS}"
-UNLOCK="${UNLOCK}"
 SECUREBOOT="${SECUREBOOT}"
 HOSTONLY="${HOSTONLY}"
 SKIP_NVRAM="${SKIP_NVRAM}"
@@ -454,5 +451,5 @@ log "unmounting"
 umount -R "$MNT" 2>/dev/null || true
 [ "$USE_LVM" = yes ] && vgchange -an "$VG" 2>/dev/null || true
 [ "$USE_LUKS" = yes ] && cryptsetup close cryptroot 2>/dev/null || true
-log "INSTALL COMPLETE (FS=$FS LVM=$USE_LVM LUKS=$USE_LUKS UNLOCK=$UNLOCK SB=$SECUREBOOT)"
+log "INSTALL COMPLETE (FS=$FS LVM=$USE_LVM LUKS=$USE_LUKS SB=$SECUREBOOT)"
 echo "cmdline was: $CMDLINE"

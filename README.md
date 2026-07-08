@@ -64,7 +64,7 @@ everything not supplied.
 ```sh
 sudo NONINTERACTIVE=yes \
   TARGET_DISK=/dev/disk/by-id/ata-... \
-  FS=btrfs USE_LUKS=yes UNLOCK=tpm2 SECUREBOOT=yes \
+  FS=btrfs USE_LUKS=yes SECUREBOOT=yes \
   LUKSPW='choose-a-passphrase' \
   bash install.sh
 ```
@@ -89,7 +89,6 @@ such as `/dev/sda` can change between boots.
 | `LVM_THIN` | `yes`, `no` (thin provision the root LV) | `no` |
 | `ROOT_SIZE` | root LV size, or `100%FREE` (LVM only) | `100%FREE` |
 | `USE_LUKS` | `yes`, `no` | `no` |
-| `UNLOCK` | `tpm2`, `passphrase` (LUKS only) | `passphrase` |
 | `SECUREBOOT` | `yes`, `no` | `yes` |
 | `HOSTONLY` | `yes`, `no` (host-specific vs generic initramfs) | `no` |
 | `HOSTNAME_` | target hostname | `pve` |
@@ -126,18 +125,32 @@ so out-of-tree drivers load under kernel lockdown.
 
 ## LUKS and TPM2 auto-unlock
 
-If you choose `UNLOCK=tpm2`, the installer writes a `crypttab` entry with
-`tpm2-device=auto` but does not enroll the TPM during installation. Enrollment
-must happen after the first real boot, because the Secure Boot measurement
-(PCR 7) is only stable once the MOK is enrolled. Run the bundled helper once,
-after MokManager and the first passphrase boot:
+Every LUKS install is identical: it creates a passphrase (slot 0) and a
+`crypttab` entry with `tpm2-device=auto`. That option is harmless with no TPM
+slot enrolled, so the system boots on the passphrase until you decide to add the
+TPM. The installer does not enroll the TPM during installation, and it cannot:
+TPM enrollment binds to the Secure Boot state (PCR 7), and PCR 7 is only stable
+once the MOK has been enrolled at MokManager. Enrolling earlier would bind to a
+PCR 7 that no longer matches after the MOK is added, and unlock would fall back
+to the passphrase. TPM auto-unlock is therefore an optional post-boot step.
 
-```sh
-pve-tpm-enroll
-```
+So the TPM is enrolled once, after the first boot, with the bundled helper:
 
-Reboot, and the root unlocks from the TPM with no passphrase. The policy is
-signed against PCR 11, so kernel upgrades do not break it.
+1. Install with `USE_LUKS=yes` and a passphrase. Reboot.
+2. First boot stops in MokManager. Enroll the MOK (enter `MOKPW`) and continue.
+3. The system boots and asks for the LUKS passphrase. Enter it and log in.
+4. Run the helper, then reboot:
+
+   ```sh
+   pve-tpm-enroll
+   reboot
+   ```
+
+The root now unlocks from the TPM with no passphrase. The policy is signed
+against PCR 11, so kernel and command-line changes do not break it. If a reboot
+still asks for the passphrase (for example because you enrolled another MOK or
+changed Secure Boot keys afterward), the PCR 7 state moved; run `pve-tpm-enroll`
+again and reboot. The passphrase slot always remains as a fallback.
 
 ## Changing the kernel command line later
 
@@ -150,18 +163,17 @@ install time). To add or change options on the installed system:
 # 1. edit the single command-line file (one line, space separated)
 $EDITOR /etc/kernel/cmdline
 
-# 2. rebuild and re-sign the UKI for the running kernel
-/etc/kernel/postinst.d/zz-ukify "$(uname -r)"
-
-# for every installed kernel at once:
-for k in /boot/vmlinuz-*; do /etc/kernel/postinst.d/zz-ukify "${k#/boot/vmlinuz-}"; done
-
-# 3. reboot
+# 2. rebuild and re-sign the UKI, then reboot
+pve-uki-rebuild
 ```
 
-The hook re-signs the UKI with the MOK, so Secure Boot stays valid, and it
+`pve-uki-rebuild` regenerates the initrd and rebuilds the UKI for every installed
+kernel (pass a version, for example `pve-uki-rebuild "$(uname -r)"`, to do just
+one). It re-signs the UKI with the MOK, so Secure Boot stays valid, and it
 regenerates the signed PCR 11 policy, so TPM2 auto-unlock keeps working. A
-command-line change is handled the same way as a kernel upgrade.
+command-line change is handled the same way as a kernel upgrade. The same helper
+is what you run after changing the dracut configuration under
+`/etc/dracut.conf.d`.
 
 The usual Debian and Proxmox methods do not apply here: GRUB is disabled, and
 `/etc/cmdline.d/*` is not read for UKIs. `/etc/kernel/cmdline` is the one source.
