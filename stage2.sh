@@ -85,6 +85,13 @@ apt-get install -y -qq \
   dracut systemd-boot systemd-boot-efi systemd-ukify sbsigntool shim-signed \
   cryptsetup lvm2 tpm2-tools efibootmgr openssl
 
+# Filesystem tools for the root FS and for any secondary disks the admin adds
+# later. Install all supported so the running system can manage its own root and
+# additional pools; btrfs-progs also ships the udev rules a multi-device btrfs
+# needs to auto-assemble and mount at boot.
+log "install filesystem tools"
+apt-get install -y -qq btrfs-progs xfsprogs e2fsprogs
+
 # ---------- dracut: initrd with crypt/lvm/tpm2 for the signed-PCR unlock.
 #            HOSTONLY=yes -> host-specific (smaller, tied to this hardware);
 #            no -> generic (boots on varied hardware). The signed PCR policy
