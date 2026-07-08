@@ -39,6 +39,12 @@
 #
 set -euo pipefail
 
+# The Proxmox and Debian install CDs run a minimal environment that does not
+# wire up /dev/fd, which bash process substitution and some tools need. Ensure
+# /proc is mounted and /dev/fd points at it, so the installer runs anywhere.
+[ -e /proc/self/fd ] || mount -t proc proc /proc 2>/dev/null || true
+[ -e /dev/fd ] || ln -sf /proc/self/fd /dev/fd 2>/dev/null || true
+
 # ---------------- config ----------------
 # Every setting may be supplied via the environment (scripted/testing) or
 # prompted interactively (real installs). An env-provided value is always
@@ -78,10 +84,16 @@ ask_secret(){ # ask_secret VAR "label" DEFAULT MIN MAX(0=unbounded)
 }
 
 pick_disk(){ # interactive target-disk selection
-  local disks=() sizes=() models=() line name size model n ans
-  while IFS= read -r line; do
-    name="${line%% *}"; disks+=("$name")
-  done < <(lsblk -dpno NAME 2>/dev/null | grep -vE '/dev/(loop|sr|zram)')
+  # No process substitution (< <(...)): it needs /dev/fd, which some minimal
+  # live environments lack. Command substitution + a newline-split loop is
+  # portable. set -f keeps device paths from being glob-expanded.
+  local disks=() line n ans d _ifs="$IFS"
+  set -f; IFS='
+'
+  for line in $(lsblk -dpno NAME 2>/dev/null | grep -vE '/dev/(loop|sr|zram)'); do
+    [ -n "$line" ] && disks+=("$line")
+  done
+  set +f; IFS="$_ifs"
   [ "${#disks[@]}" -eq 0 ] && { echo "no disks found"; exit 1; }
   echo "Available disks:"
   n=1; for d in "${disks[@]}"; do
@@ -96,8 +108,13 @@ pick_disk(){ # interactive target-disk selection
 }
 
 pick_part(){ # pick_part VAR "question" — choose an existing partition
-  local var="$1" q="$2" parts=() p n ans
-  while IFS= read -r p; do parts+=("$p"); done < <(lsblk -pno NAME,TYPE 2>/dev/null | awk '$2=="part"{print $1}')
+  local var="$1" q="$2" parts=() p n ans _ifs="$IFS"
+  set -f; IFS='
+'
+  for p in $(lsblk -pno NAME,TYPE 2>/dev/null | awk '$2=="part"{print $1}'); do
+    [ -n "$p" ] && parts+=("$p")
+  done
+  set +f; IFS="$_ifs"
   if [ "${#parts[@]}" -gt 0 ]; then
     echo "Existing partitions:"
     n=1; for p in "${parts[@]}"; do printf '  %d) %s\n' "$n" "$(lsblk -pno NAME,SIZE,FSTYPE,PARTLABEL "$p" 2>/dev/null)"; n=$((n+1)); done
