@@ -21,9 +21,13 @@ overwrite the configuration and nothing needs pinning.
 - Optional LUKS2 on the root partition, unlocked either by passphrase or by the
   TPM2 (signed PCR 11 policy, so it survives kernel upgrades).
 - Optional LVM (thin or thick) with a configurable root size.
-- Filesystems: ext4, xfs, or btrfs. btrfs installs onto a single `@` subvolume
-  with `compress=zstd:1,noatime,space_cache=v2,discard=async`, which keeps a
-  whole-root snapshot a single command.
+- Filesystems: ext4, xfs, btrfs, or ZFS. btrfs installs onto a single `@`
+  subvolume with `compress=zstd:1,noatime,space_cache=v2,discard=async`, which
+  keeps a whole-root snapshot a single command.
+- Root on ZFS: a single pool (default `rpool`) with a `rpool/ROOT/pve` boot
+  dataset, imported by the dracut `zfs` module from the UKI. The Proxmox kernel
+  ships ZFS built in, so no DKMS is needed. Encryption is optional: OpenZFS native
+  (passphrase at boot) or LUKS underneath the pool (the TPM2 path below).
 - Secure Boot using the Microsoft-signed shim plus a Machine Owner Key (MOK).
   The same MOK signs the UKI, systemd-boot, and DKMS/out-of-tree modules, so
   custom modules load under lockdown.
@@ -31,10 +35,34 @@ overwrite the configuration and nothing needs pinning.
 ## Requirements
 
 - A UEFI target machine.
-- A Linux live environment with a network connection. Debian live is the
-  reference, but any Debian-family live environment works. Missing tools
-  (`debootstrap`, `cryptsetup`, `gdisk`, and so on) are installed automatically.
+- A Linux live environment with a network connection. The Proxmox VE ISO
+  (debug/rescue shell) is the reference and, unlike a plain Debian netinst, it
+  works out of the box; any Debian-family live environment with the tools also
+  works. Missing tools (`debootstrap`, `cryptsetup`, `gdisk`, and so on) are
+  installed automatically.
+- For a **ZFS root** (`FS=zfs`), the live environment must have working ZFS
+  (`zpool` must run), because the pool is created before the target exists. The
+  Proxmox VE ISO ships ZFS; a plain Debian live does not.
 - Network access to the Debian and Proxmox package repositories.
+
+## Root on ZFS
+
+With `FS=zfs` the installer creates a single pool on the root partition and a
+boot dataset layout, then boots it from the UKI via the dracut `zfs` module:
+
+```
+rpool                 (mountpoint=none)
+  rpool/ROOT          (mountpoint=none)
+    rpool/ROOT/pve    (mountpoint=/, the booted root)
+```
+
+`bootfs` is set on the pool and the kernel command line is
+`root=zfs:rpool/ROOT/pve`. The Proxmox kernel ships ZFS built in, so no DKMS is
+built; the installer adds only the dracut `zfs` module and OpenZFS userland. The
+pool is exported cleanly at the end of the install so it imports on first boot
+without a force flag. Encryption is optional: `ZFS_ENC=native` (OpenZFS native
+encryption, passphrase prompted in the initramfs) or `ZFS_ENC=luks` (LUKS under
+the pool, reusing the TPM2 auto-unlock path below).
 
 ## Quick start
 
@@ -83,17 +111,20 @@ such as `/dev/sda` can change between boots.
 | `FORMAT_ESP` | `yes`, `no` (no reuses an existing ESP) | `yes`, `no` when reusing |
 | `ESP_SIZE` | EFI partition size (auto, freespace) | `1GiB` |
 | `ROOT_PART_SIZE` | root partition size, or `rest` for the remainder | `rest` |
-| `FS` | `ext4`, `xfs`, `btrfs` | `ext4` |
+| `FS` | `ext4`, `xfs`, `btrfs`, `zfs` | `ext4` |
+| `ZPOOL` | ZFS pool name (FS=zfs) | `rpool` |
+| `ZFS_ENC` | `none`, `native`, `luks` (FS=zfs encryption) | `none` |
 | `BTRFS_OPTS` | btrfs mount options | `compress=zstd:1,noatime,space_cache=v2,discard=async` |
-| `USE_LVM` | `yes`, `no` | `no` |
+| `USE_LVM` | `yes`, `no` (non-zfs) | `no` |
 | `LVM_THIN` | `yes`, `no` (thin provision the root LV) | `no` |
 | `ROOT_SIZE` | root LV size, or `100%FREE` (LVM only) | `100%FREE` |
-| `USE_LUKS` | `yes`, `no` | `no` |
+| `USE_LUKS` | `yes`, `no` (non-zfs; zfs uses ZFS_ENC) | `no` |
 | `SECUREBOOT` | `yes`, `no` | `yes` |
 | `HOSTONLY` | `yes`, `no` (host-specific vs generic initramfs) | `no` |
 | `HOSTNAME_` | target hostname | `pve` |
 | `ROOTPW` | root password | `proxmox` |
 | `LUKSPW` | LUKS passphrase | `proxmox` |
+| `ZFSPW` | ZFS native-encryption passphrase (ZFS_ENC=native) | `proxmox` |
 | `MOKPW` | one-time MokManager password, 8 to 16 characters | `12345678` |
 | `EXTRA_CMDLINE` | extra kernel command line, appended verbatim | |
 | `SKIP_NVRAM` | `yes` skips the efibootmgr entry, uses the removable fallback | `no` |

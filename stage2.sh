@@ -29,7 +29,11 @@ printf '127.0.0.1 localhost\n10.0.0.10 %s.localdomain %s\n' "$HOSTNAME_" "$HOSTN
 btrfs_opts=""
 [ "$FS" = btrfs ] && btrfs_opts=",subvol=@,${BTRFS_OPTS:-compress=zstd:1,noatime,space_cache=v2,discard=async}"
 {
-  echo "UUID=$ROOT_UUID / $FS defaults${btrfs_opts} 0 1"
+  if [ "$FS" = zfs ]; then
+    echo "# root is on ZFS (${ROOT_DATASET}), mounted via root=zfs: and the dataset mountpoint"
+  else
+    echo "UUID=$ROOT_UUID / $FS defaults${btrfs_opts} 0 1"
+  fi
   echo "UUID=$ESP_UUID /boot/efi vfat umask=0077 0 2"
 } > /etc/fstab
 
@@ -71,11 +75,25 @@ for h in systemd-boot proxmox-boot-sync; do
 done
 
 # ---------- prevent service starts during chroot config ----------
+# policy-rc.d stops invoke-rc.d from starting services, but some maintainer
+# scripts call `systemctl enable --now` directly, and `--now` fails hard in a
+# chroot. Shadow systemctl with a shim on PATH that drops --now and no-ops
+# runtime actions, so `enable` still writes its symlink while nothing starts.
 cat > /usr/sbin/policy-rc.d <<'EOF'
 #!/bin/sh
 exit 101
 EOF
 chmod +x /usr/sbin/policy-rc.d
+cat > /usr/local/bin/systemctl <<'EOF'
+#!/bin/sh
+args=""
+for a in "$@"; do [ "$a" = "--now" ] && continue; args="$args $a"; done
+case " $args " in
+  *" start "*|*" restart "*|*" reload "*|*" try-restart "*|*" reload-or-restart "*) exit 0 ;;
+esac
+exec /usr/bin/systemctl $args
+EOF
+chmod +x /usr/local/bin/systemctl
 
 # ---------- boot + UKI toolchain (tpm2-tools pulls libtss2, needed by ukify's
 #            PCR signing; dracut satisfies the kernel initramfs alternative so
@@ -102,6 +120,12 @@ cat > /etc/dracut.conf.d/10-uki.conf <<EOF
 hostonly="${HOSTONLY:-no}"
 add_dracutmodules+=" crypt lvm tpm2-tss systemd "
 EOF
+# ZFS: keep a stable hostid so the initramfs imports the pool without -f
+# (install.sh copied the live-env hostid that created the pool). The zfs dracut
+# module itself is added later, after zfs-dracut is installed.
+if [ "$FS" = zfs ]; then
+  [ -s /etc/hostid ] || zgenhostid 2>/dev/null || true
+fi
 
 # ---------- crypttab for TPM auto-unlock. This is what makes systemd-cryptsetup
 #            actually try the TPM: rd.luks.uuid alone generates a unit with no
@@ -215,6 +239,38 @@ EOF
 log "install proxmox-ve"
 apt-get install -y proxmox-ve </dev/null || { rc=$?; echo "proxmox-ve apt rc=$rc; settling"; dpkg --configure -a || true; }
 
+# ---------- ZFS root: userland + dracut module, then a final UKI rebuild.
+#            The Proxmox kernel ships ZFS built in, so no DKMS is needed; we only
+#            add the OpenZFS tools and the dracut zfs module (90zfs). The module is
+#            enabled AFTER it exists (forcing it earlier would break the kernel's
+#            own initrd build); the final rebuild bakes zfs + the pool import in. ----------
+if [ "$FS" = zfs ]; then
+  log "install ZFS userland (Proxmox kernel bundles zfs.ko; no DKMS)"
+  apt-get install -y -qq zfsutils-linux zfs-zed
+  # Proxmox ships zfs-initramfs (initramfs-tools), not zfs-dracut, and Debian's
+  # zfs-dracut would drag in zfs-dkms. Install just the dracut 90zfs module FILES
+  # from Debian contrib's zfs-dracut, download-only (no dependency resolution).
+  # The scripts are kernel-independent; zfs.ko comes from the Proxmox kernel and
+  # zpool/zfs from Proxmox's zfsutils-linux.
+  ( cd /tmp
+    if apt-get download zfs-dracut 2>/dev/null && ls zfs-dracut_*.deb >/dev/null 2>&1; then
+      dpkg-deb --fsys-tarfile zfs-dracut_*.deb | tar -C / -x --wildcards --no-same-owner \
+        './usr/lib/dracut/modules.d/*zfs*' './usr/lib/dracut-zfs-lib.sh' \
+        './usr/lib/systemd/system/zfs*' './usr/lib/systemd/system-generators/*zfs*' \
+        './usr/lib/modules-load.d/zfs.conf' 2>/dev/null || true
+      rm -f zfs-dracut_*.deb
+    fi )
+  [ -d /usr/lib/dracut/modules.d/90zfs ] || echo "WARNING: dracut 90zfs module not present"
+  {
+    echo 'add_dracutmodules+=" zfs "'
+    echo 'install_items+=" /etc/hostid "'
+  } > /etc/dracut.conf.d/18-zfs.conf
+  systemctl enable zfs-import-scan.service zfs-import.target zfs-mount.service \
+    zfs-zed.service zfs.target >/dev/null 2>&1 || true
+  log "final UKI rebuild (bake zfs.ko + pool import into the initrd)"
+  /usr/local/sbin/pve-uki-rebuild
+fi
+
 # ---------- place the loader in the ESP ----------
 log "install loader (SECUREBOOT=$SECUREBOOT)"
 mkdir -p /boot/efi/EFI/systemd /boot/efi/EFI/BOOT /boot/efi/loader/entries
@@ -297,8 +353,8 @@ log "root password + serial getty"
 echo "root:$ROOTPW" | chpasswd
 systemctl enable serial-getty@ttyS0.service >/dev/null 2>&1 || true
 
-# ---------- remove chroot service guard ----------
-rm -f /usr/sbin/policy-rc.d
+# ---------- remove chroot service guards ----------
+rm -f /usr/sbin/policy-rc.d /usr/local/bin/systemctl
 
 # ---------- report ----------
 log "RESULT"
@@ -306,6 +362,10 @@ echo "kernel(s):"; ls /boot/vmlinuz-* 2>/dev/null || echo "  NONE"
 echo "UKI(s):"; ls -la /boot/efi/EFI/Linux/ 2>&1
 echo "UKI sections:"; for u in /boot/efi/EFI/Linux/*.efi; do objdump -h "$u" 2>/dev/null | grep -oE "\.(linux|initrd|cmdline|osrel|pcrsig|pcrpkey|sbat|uname)" | tr '\n' ' '; echo; done
 echo "UKI SB-signed by MOK?"; for u in /boot/efi/EFI/Linux/*.efi; do sbverify --cert "$KDIR/MOK.crt" "$u" 2>&1 | head -1; done
+if [ "$FS" = zfs ]; then
+  echo "zfs dracut module configured:"; grep -h zfs /etc/dracut.conf.d/*.conf 2>/dev/null | tr '\n' ' '; echo
+  echo "zfs.ko present:"; find /lib/modules -name 'zfs.ko*' 2>/dev/null | head -1 || echo "  (bundled in kernel)"
+fi
 echo "diverted hooks (want .disabled present, live path gone):"; ls /etc/kernel/postinst.d/ | grep -E "zz-|dracut" | tr '\n' ' '; echo
 echo "grub installed (dormant, hook diverted):"; dpkg -l grub-efi-amd64 2>/dev/null | grep -q ^ii && echo yes || echo no
 echo "initramfs-tools installed? (want no):"; dpkg -l initramfs-tools 2>/dev/null | grep -q ^ii && echo yes || echo no

@@ -155,15 +155,30 @@ else
   [ -b "$TARGET_DISK" ] || { echo "TARGET_DISK $TARGET_DISK is not a block device"; exit 1; }
 fi
 
-ask FS         "Root filesystem"            ext4  ext4 btrfs xfs
-ask USE_LVM    "Use LVM?"                    no    no yes
-if [ "$USE_LVM" = yes ]; then
-  ask LVM_THIN   "LVM thin provisioning?"    no    no yes
-  ask ROOT_SIZE  "Root LV size (e.g. 100G, 100%FREE)" 100%FREE
+ask FS         "Root filesystem"            ext4  ext4 zfs btrfs xfs
+if [ "$FS" = zfs ]; then
+  # Proxmox's kernel ships ZFS built in, so a ZFS root needs no DKMS. The pool
+  # replaces LVM; encryption is either OpenZFS native (passphrase at boot) or
+  # LUKS underneath the pool (the existing TPM2 auto-unlock path).
+  ask ZPOOL   "ZFS pool name" rpool
+  ask ZFS_ENC "ZFS encryption" none  none native luks
+  USE_LVM=no; LVM_THIN=no; ROOT_SIZE=100%FREE
+  case "$ZFS_ENC" in
+    luks) USE_LUKS=yes ;;
+    none|native) USE_LUKS=no ;;
+    *) echo "ZFS_ENC must be none, native or luks"; exit 1 ;;
+  esac
 else
-  LVM_THIN="${LVM_THIN:-no}"; ROOT_SIZE="${ROOT_SIZE:-100%FREE}"
+  ZPOOL="${ZPOOL:-rpool}"; ZFS_ENC=none
+  ask USE_LVM    "Use LVM?"                    no    no yes
+  if [ "$USE_LVM" = yes ]; then
+    ask LVM_THIN   "LVM thin provisioning?"    no    no yes
+    ask ROOT_SIZE  "Root LV size (e.g. 100G, 100%FREE)" 100%FREE
+  else
+    LVM_THIN="${LVM_THIN:-no}"; ROOT_SIZE="${ROOT_SIZE:-100%FREE}"
+  fi
+  ask USE_LUKS   "Encrypt root with LUKS?"     no    no yes
 fi
-ask USE_LUKS   "Encrypt root with LUKS?"     no    no yes
 # LUKS always installs a passphrase slot and a crypttab that is ready for TPM2
 # (tpm2-device=auto, harmless with no TPM slot). TPM auto-unlock is an optional
 # post-boot step: run pve-tpm-enroll once the MOK is enrolled. So there is no
@@ -177,6 +192,11 @@ if [ "$USE_LUKS" = yes ]; then
   ask_secret LUKSPW "LUKS passphrase" proxmox 1 0
 else
   LUKSPW="${LUKSPW:-proxmox}"
+fi
+if [ "$ZFS_ENC" = native ]; then
+  ask_secret ZFSPW "ZFS encryption passphrase (min 8)" proxmox 8 0
+else
+  ZFSPW="${ZFSPW:-proxmox}"
 fi
 if [ "$SECUREBOOT" = yes ]; then
   # one-time password typed at MokManager (enroll + trust); mokutil requires 8..16 chars
@@ -217,8 +237,22 @@ part(){ # partition device name for a disk + index (handles nvme/mmc p-suffix)
   esac
 }
 
-teardown(){ # release all mounts / LVM / LUKS this script may hold (idempotent)
+zap_pools_on(){ # export/destroy any imported zpool whose vdevs live on this disk
+  command -v zpool >/dev/null 2>&1 || return 0
+  local disk="$1" p
+  for p in $(zpool list -H -o name 2>/dev/null); do
+    if zpool status -P "$p" 2>/dev/null | grep -q "${disk}"; then
+      zpool destroy -f "$p" 2>/dev/null || zpool export -f "$p" 2>/dev/null || true
+    fi
+  done
+}
+
+teardown(){ # release all mounts / LVM / LUKS / zpool this script may hold (idempotent)
   set +e
+  if [ "$FS" = zfs ] && command -v zpool >/dev/null 2>&1; then
+    zfs unmount -a 2>/dev/null
+    zpool export "$ZPOOL" 2>/dev/null   # clean export => boots without -f
+  fi
   umount -R "$MNT" 2>/dev/null || umount -Rl "$MNT" 2>/dev/null
   swapoff -a 2>/dev/null
   for vg in $(vgs --noheadings -o vg_name 2>/dev/null | tr -d ' '); do
@@ -236,14 +270,31 @@ trap teardown EXIT
 need="debootstrap cryptsetup gdisk dosfstools parted"
 [ "$FS" = btrfs ] && need="$need btrfs-progs"
 [ "$FS" = xfs ] && need="$need xfsprogs"
+[ "$FS" = zfs ] && need="$need zfsutils-linux"
 [ "$USE_LVM" = yes ] && need="$need lvm2"
 [ "$LVM_THIN" = yes ] && need="$need thin-provisioning-tools"
 missing=""
-for t in $need; do dpkg -s "$t" >/dev/null 2>&1 || missing="$missing $t"; done
+for t in $need; do
+  case "$t" in
+    zfsutils-linux) command -v zpool >/dev/null 2>&1 || missing="$missing $t" ;;
+    *) dpkg -s "$t" >/dev/null 2>&1 || missing="$missing $t" ;;
+  esac
+done
 if [ -n "$missing" ]; then
   log "installing live-env tools:$missing"
   export DEBIAN_FRONTEND=noninteractive
-  apt-get update -qq && apt-get install -y -qq $missing
+  apt-get update -qq && apt-get install -y -qq $missing || true
+fi
+# ZFS needs the kernel module loaded in the LIVE environment to create the pool.
+# The Proxmox VE installer ISO already has working ZFS; a plain Debian live may not.
+if [ "$FS" = zfs ]; then
+  modprobe zfs 2>/dev/null || true
+  if ! zpool version >/dev/null 2>&1; then
+    echo "ERROR: ZFS is not available in this live environment (zpool/zfs.ko missing)."
+    echo "Run from the Proxmox VE installer ISO (Advanced -> shell) or another live"
+    echo "image with working ZFS. FS=zfs creates the pool before the target exists."
+    exit 1
+  fi
 fi
 
 # ---------------- 0a. summary + destructive confirmation ----------------
@@ -258,7 +309,7 @@ cat <<SUMMARY
   Mode        : $PART_MODE
   Target      : $_tgt
   Layout      : $_sz
-  Filesystem  : $FS$( [ "$FS" = btrfs ] && echo " (subvol @, $BTRFS_OPTS)" )$( [ "$USE_LVM" = yes ] && echo "  on LVM$( [ "$LVM_THIN" = yes ] && echo " (thin)" ), root LV=$ROOT_SIZE" )
+  Filesystem  : $FS$( [ "$FS" = zfs ] && echo " (pool $ZPOOL, enc=$ZFS_ENC)" )$( [ "$FS" = btrfs ] && echo " (subvol @, $BTRFS_OPTS)" )$( [ "$USE_LVM" = yes ] && echo "  on LVM$( [ "$LVM_THIN" = yes ] && echo " (thin)" ), root LV=$ROOT_SIZE" )
   LUKS        : $USE_LUKS$( [ "$USE_LUKS" = yes ] && echo "  (passphrase now; add TPM later with pve-tpm-enroll)" )
   Secure Boot : $SECUREBOOT$( [ "$SECUREBOOT" = yes ] && echo "  (shim + MOK, confirm at MokManager)" )
   Initramfs   : $( [ "$HOSTONLY" = yes ] && echo host-specific || echo generic )
@@ -281,6 +332,7 @@ esp_end=$( case "$ESP_SIZE" in rest|max|100%*|"") echo 0 ;; *) echo "+${ESP_SIZE
 case "$PART_MODE" in
   auto)
     log "partitioning $TARGET_DISK (auto wipe; ESP ${ESP_SIZE} + root ${ROOT_PART_SIZE})"
+    zap_pools_on "$TARGET_DISK"   # release any imported ZFS pool on this disk
     # dd-zero first + last 16 MiB: nukes stale ZFS vdev labels, mdraid superblocks,
     # LUKS headers and the GPT backup so wipefs/sgdisk/mkfs can't trip over ghosts
     # (same approach as cache22's installer). AUTO ONLY: it destroys the whole disk.
@@ -339,6 +391,8 @@ done
 # still has registered (btrfs auto-scan) or signatures that make mkfs/luksFormat
 # report "Device or resource busy". Clear them. (auto wiped the whole disk above.)
 if [ "$PART_MODE" != auto ]; then
+  zap_pools_on "$TARGET_DISK" 2>/dev/null || true
+  zpool labelclear -f "$P2" 2>/dev/null || true
   btrfs device scan --forget "$P2" 2>/dev/null || true
   wipefs -a "$P2" 2>/dev/null || true
 fi
@@ -385,20 +439,44 @@ else
 fi
 
 # ---------------- 5. root filesystem ----------------
-log "mkfs root ($FS) on $ROOTDEV"
-case "$FS" in
-  ext4)  mkfs.ext4 -F -L proxroot "$ROOTDEV" ;;
-  xfs)   mkfs.xfs  -f -L proxroot "$ROOTDEV" ;;
-  btrfs) mkfs.btrfs -f -L proxroot "$ROOTDEV" ;;
-  *) echo "unknown FS=$FS"; exit 1 ;;
-esac
-ROOT_UUID=$(blkid -s UUID -o value "$ROOTDEV")
+ROOT_DATASET=""
+ROOT_UUID=""
+if [ "$FS" = zfs ]; then
+  ROOT_DATASET="${ZPOOL}/ROOT/pve"
+  log "create zpool $ZPOOL on $ROOTDEV (enc=$ZFS_ENC)"
+  zpool create -f \
+    -o ashift=12 -o autotrim=on \
+    -O compression=zstd -O acltype=posixacl -O xattr=sa -O dnodesize=auto \
+    -O atime=off -O relatime=on -O normalization=formD -O mountpoint=none -O canmount=off \
+    -R "$MNT" "$ZPOOL" "$ROOTDEV"
+  if [ "$ZFS_ENC" = native ]; then
+    printf '%s\n%s\n' "$ZFSPW" "$ZFSPW" | zfs create \
+      -o canmount=off -o mountpoint=none \
+      -o encryption=aes-256-gcm -o keyformat=passphrase -o keylocation=prompt "${ZPOOL}/ROOT"
+  else
+    zfs create -o canmount=off -o mountpoint=none "${ZPOOL}/ROOT"
+  fi
+  zfs create -o canmount=noauto -o mountpoint=/ "$ROOT_DATASET"
+  zfs mount "$ROOT_DATASET"
+  zpool set bootfs="$ROOT_DATASET" "$ZPOOL"
+else
+  log "mkfs root ($FS) on $ROOTDEV"
+  case "$FS" in
+    ext4)  mkfs.ext4 -F -L proxroot "$ROOTDEV" ;;
+    xfs)   mkfs.xfs  -f -L proxroot "$ROOTDEV" ;;
+    btrfs) mkfs.btrfs -f -L proxroot "$ROOTDEV" ;;
+    *) echo "unknown FS=$FS"; exit 1 ;;
+  esac
+  ROOT_UUID=$(blkid -s UUID -o value "$ROOTDEV")
+fi
 ESP_UUID=$(blkid -s UUID -o value "$ESP")
 
 # ---------------- 6. mount target ----------------
 log "mount target at $MNT"
 mkdir -p "$MNT"
-if [ "$FS" = btrfs ]; then
+if [ "$FS" = zfs ]; then
+  : # pool already mounted at $MNT via altroot
+elif [ "$FS" = btrfs ]; then
   mount "$ROOTDEV" "$MNT"
   btrfs subvolume create "$MNT/@" >/dev/null
   umount "$MNT"
@@ -414,9 +492,13 @@ log "debootstrap $SUITE"
 debootstrap --arch=amd64 "$SUITE" "$MNT" "$MIRROR"
 
 # ---------------- 8. build kernel cmdline ----------------
-CMDLINE="root=UUID=${ROOT_UUID} ro rootfstype=${FS}"
-[ "$FS" = btrfs ] && CMDLINE="$CMDLINE rootflags=subvol=@,$BTRFS_OPTS"
-[ "$USE_LVM" = yes ] && CMDLINE="$CMDLINE rd.lvm.lv=${VG}/root"
+if [ "$FS" = zfs ]; then
+  CMDLINE="root=zfs:${ROOT_DATASET} ro"
+else
+  CMDLINE="root=UUID=${ROOT_UUID} ro rootfstype=${FS}"
+  [ "$FS" = btrfs ] && CMDLINE="$CMDLINE rootflags=subvol=@,$BTRFS_OPTS"
+  [ "$USE_LVM" = yes ] && CMDLINE="$CMDLINE rd.lvm.lv=${VG}/root"
+fi
 # NOTE: LUKS is driven by /etc/crypttab (tpm2-device=auto), NOT rd.luks.uuid.
 # rd.luks.uuid alone makes the systemd-cryptsetup generator create a unit with
 # no tpm2 option (so it never tries the TPM and falls to the passphrase); and
@@ -429,6 +511,9 @@ CMDLINE=$(echo "$CMDLINE" | tr -s ' ')
 log "writing stage2 config"
 cat > "$MNT/root/install.env" <<EOF
 FS="${FS}"
+ZPOOL="${ZPOOL}"
+ZFS_ENC="${ZFS_ENC}"
+ROOT_DATASET="${ROOT_DATASET}"
 USE_LVM="${USE_LVM}"
 LVM_THIN="${LVM_THIN}"
 USE_LUKS="${USE_LUKS}"
@@ -438,6 +523,7 @@ SKIP_NVRAM="${SKIP_NVRAM}"
 HOSTNAME_="${HOSTNAME_}"
 ROOTPW="${ROOTPW}"
 LUKSPW="${LUKSPW}"
+ZFSPW="${ZFSPW}"
 MOKPW="${MOKPW}"
 BTRFS_OPTS="${BTRFS_OPTS}"
 ROOT_UUID="${ROOT_UUID}"
@@ -460,6 +546,9 @@ for d in proc sys dev dev/pts run; do
 done
 # efivarfs for bootctl/efibootmgr
 mount -t efivarfs efivarfs "$MNT/sys/firmware/efi/efivars" 2>/dev/null || true
+# ZFS needs a stable hostid shared between the live-created pool and the target
+# initramfs so the pool imports at boot without an -f override.
+if [ "$FS" = zfs ] && [ -f /etc/hostid ]; then cp /etc/hostid "$MNT/etc/hostid"; fi
 
 chroot "$MNT" /bin/bash /root/stage2.sh
 
@@ -472,8 +561,15 @@ done
 
 # ---------------- 12. done ----------------
 log "unmounting"
-umount -R "$MNT" 2>/dev/null || true
-[ "$USE_LVM" = yes ] && vgchange -an "$VG" 2>/dev/null || true
-[ "$USE_LUKS" = yes ] && cryptsetup close cryptroot 2>/dev/null || true
-log "INSTALL COMPLETE (FS=$FS LVM=$USE_LVM LUKS=$USE_LUKS SB=$SECUREBOOT)"
+umount -R "$MNT/boot/efi" 2>/dev/null || true
+if [ "$FS" = zfs ]; then
+  umount -R "$MNT" 2>/dev/null || true
+  zfs unmount -a 2>/dev/null || true
+  zpool export "$ZPOOL" 2>/dev/null || true   # clean export => boots without -f
+else
+  umount -R "$MNT" 2>/dev/null || true
+  [ "$USE_LVM" = yes ] && vgchange -an "$VG" 2>/dev/null || true
+  [ "$USE_LUKS" = yes ] && cryptsetup close cryptroot 2>/dev/null || true
+fi
+log "INSTALL COMPLETE (FS=$FS$( [ "$FS" = zfs ] && echo "/enc=$ZFS_ENC" ) LVM=$USE_LVM LUKS=$USE_LUKS SB=$SECUREBOOT)"
 echo "cmdline was: $CMDLINE"
